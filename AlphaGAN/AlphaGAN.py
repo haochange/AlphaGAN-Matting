@@ -7,13 +7,16 @@ import tqdm
 import numpy as np
 from visualize import Visualizer
 import math
+import torch.nn.functional as F
 
 
 # ASPP
+# ASPP replaces the pooling layer of SPP module with Dilated Convolution with different rates
 class _AsppBlock(nn.Sequential):
 
     def __init__(self, in_channels, out_channels, kernel_size, dilation_rate):
         super(_AsppBlock, self).__init__()
+        # If dilation rate is greater than 1, it is dilated convolution
         if dilation_rate == 1:
             self.atrous_conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size)
         else:
@@ -31,7 +34,10 @@ class _AsppBlock(nn.Sequential):
 
 
 # input batch x 2048 x 40 x 40
+#Input to the ASPP module is the output of Reset block 4
 class ASPP(nn.Module):
+    
+    #From the paper https://arxiv.org/pdf/1706.05587.pdf
 
     def __init__(self, in_channels, out_channels):
         super(ASPP, self).__init__()
@@ -70,13 +76,16 @@ class ASPP(nn.Module):
 
 
 # atrous_ResNet
+# Not making Basic Structure , as seen in implementation of ResNet, as ResNet50 contains only bottleneck structure
 class Bottleneck(nn.Module):
     expansion = 4
-
+    
     def __init__(self, inplanes, planes, stride=1, dilation=1, downsample=None):
         super(Bottleneck, self).__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
+        
+        #If dilation is greater than 1, then we are using Dilated Convolution, as in the case of Resnet Block 3 and 4
         if dilation != 1:
             self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
                                    padding=dilation, dilation=dilation, bias=False)
@@ -92,7 +101,7 @@ class Bottleneck(nn.Module):
 
     def forward(self, x):
         residual = x
-
+        
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -122,7 +131,8 @@ class ResNet(nn.Module):
                                 bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU()
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.maxpool  = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.max_pool = F.max_pool2d(kernel_size=3, stride=2, padding=1,return_indices=True)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilation=2)
@@ -158,6 +168,7 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        #For skip connection between decoder layer and the input image
         skip_connection1 = x  # 320 x 320
 
         x = self.conv_1(x)
@@ -165,16 +176,19 @@ class ResNet(nn.Module):
         x = self.relu(x)
         skip_connection2 = x  # 160 x 160
 
-        x = self.maxpool(x)
+        #Storing the pooling indices as well, It would be used in Decoder
+        x,pooling_indices   = self.maxpool(x)
 
         x = self.layer1(x)
+        
+        #For skip connection between block1 of Resnet-50 , It would be concatenated with a layes in decoder
         skip_connection3 = x  # 80 x 80
 
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
 
-        return x, skip_connection1, skip_connection2, skip_connection3
+        return x, skip_connection1, skip_connection2, skip_connection3,pooling_indices
 
 
 def resnet50():
@@ -190,6 +204,7 @@ class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
 
+        #The Encoder is Resnet50 + ASPP Module
         self.resnet50 = resnet50()
         self.aspp = ASPP(in_channels=2048, out_channels=256)
 
@@ -198,16 +213,17 @@ class Encoder(nn.Module):
     def _initialize_weights(self):
         # init atrous_resnet50 with the pretrained resnet
         pretrained_resnet50 = tv.models.resnet50(pretrained=True)
-        pretrained_dict = pretrained_resnet50.state_dict()
+        pretrained_dict     = pretrained_resnet50.state_dict()
 
-        atrous_resnet_dict = self.resnet50.state_dict()
+        atrous_resnet_dict  = self.resnet50.state_dict()
 
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in atrous_resnet_dict}
+        pretrained_dict     = {k: v for k, v in pretrained_dict.items() if k in atrous_resnet_dict}
 
         atrous_resnet_dict.update(pretrained_dict)
 
         self.resnet50.load_state_dict(atrous_resnet_dict)
         # init aspp
+        
         for m in self.aspp.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight)
@@ -219,11 +235,11 @@ class Encoder(nn.Module):
 
     def forward(self, x):
 
-        x, skip_connection1, skip_connection2, skip_connection3 = self.resnet50(x)
+        x, skip_connection1, skip_connection2, skip_connection3,pooling_indices = self.resnet50(x)
 
         x = self.aspp(x)
 
-        return x, skip_connection1, skip_connection2, skip_connection3
+        return x, skip_connection1, skip_connection2, skip_connection3,pooling_indices
 
 
 # decoder
@@ -232,7 +248,7 @@ class Decoder(nn.Module):
     def __init__(self):
         super(Decoder, self).__init__()
 
-        # bilinear
+        # bilinear linear Interpolation is done at the output of Encoder
         self.bilinear = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             nn.LeakyReLU(0.2),
@@ -240,6 +256,7 @@ class Decoder(nn.Module):
         )
         # output: 256 x 80 x 80
 
+        #The skip_connection 3 is added here, Output of Residual Block1 is fed to 1x1 convolution and then concatenated
         self.skip_3 = nn.Sequential(
             nn.Conv2d(in_channels=256, out_channels=48, kernel_size=1),
             nn.BatchNorm2d(48),
@@ -249,6 +266,8 @@ class Decoder(nn.Module):
 
         # deconv1_x
         self.deconv1_x = nn.Sequential(
+            #The features are concatenated with skip_connection 3, hence the value of in_channels is added by 48
+            #The 3x3 convolutions steadily reduce the dimensions to 64
             nn.ConvTranspose2d(in_channels=256+48, out_channels=256, kernel_size=3, padding=1),
             nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=3, padding=1),
             nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=3, padding=1),
@@ -257,18 +276,18 @@ class Decoder(nn.Module):
         )
         # output: 64 x 80 x 80
 
-        # unpooling
-        # well I do not  konw how to get the indices, which is requested by the MaxUnpool2d
-        # Therefore, I use the ConvTranspose2d instead of MaxUnpool2d
-        # nn.MaxUnpool2d(kernel_size=2, stride=2),
+        # I have not defined the max_unpooling layer here, instead I have added it with the definition of forward pass
+        # Rest of the unpooling layer is defined here
         self.unpooling = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.2)
         )
+        
+        
         # output: 64 x 160 x 160
 
         self.skip_2 = nn.Sequential(
+            #1x1 Convolution to change the number of dimensions
             nn.Conv2d(in_channels=64, out_channels=32, kernel_size=1),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2)
@@ -276,14 +295,19 @@ class Decoder(nn.Module):
 
         # deconv2_x
         self.deconv2_x = nn.Sequential(
+            
+            #Concatenated with a layer from encoder
             nn.ConvTranspose2d(in_channels=64+32, out_channels=64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            # Then, a few convolutinal layers
             nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
             nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2)
         )
         # output: 32 x 320 x 320
-
+        
+       
+        # Before this layer, the feature map would be concatenated with the Input(4 channels)
         # deconv3_x
         self.deconv3_x = nn.Sequential(
             nn.ConvTranspose2d(in_channels=32+4, out_channels=32, kernel_size=3, padding=1),
@@ -296,6 +320,7 @@ class Decoder(nn.Module):
         # deconv4_x
         self.deconv4_x = nn.Sequential(
             nn.ConvTranspose2d(in_channels=32, out_channels=1, kernel_size=3, padding=1),
+            #Sigmoid in the last layer, because alpha values must only be between 0 and 1
             nn.Sigmoid()
         )
         # output: 1 x 320 x 320
@@ -313,7 +338,7 @@ class Decoder(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        x, skip_connection1, skip_connection2, skip_connection3 = x
+        x, skip_connection1, skip_connection2, skip_connection3,pooling_indices = x
         x = self.bilinear(x)
 
         skip_connection3 = self.skip_3(skip_connection3)
@@ -321,7 +346,10 @@ class Decoder(nn.Module):
         x = t.cat([x, skip_connection3], dim=1)
         x = self.deconv1_x(x)
 
+        #x = self.unpooling(x)
+        x = F.max_unpool2d(x,pooling_indices,kernel_size = 2, stride = 2)
         x = self.unpooling(x)
+        
         skip_connection2 = self.skip_2(skip_connection2)
         x = t.cat([x, skip_connection2], dim=1)
         x = self.deconv2_x(x)
@@ -333,7 +361,7 @@ class Decoder(nn.Module):
         return x
 
 
-# G
+# Generator Class
 class NetG(nn.Module):
 
     def __init__(self):
@@ -349,9 +377,17 @@ class NetG(nn.Module):
 
 
 # Defines the PatchGAN discriminator with the specified arguments.
+# Reference : https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py#L318
 class NLayerDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, use_sigmoid=True):
-        super(NLayerDiscriminator, self).__init__()
+        """
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            ndf (int)       -- the number of filters in the last conv layer
+            n_layers (int)  -- the number of conv layers in the discriminator
+            norm_layer      -- normalization layer
+        """
+        super(NLayerDiscriminator, self).__init__()        
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
@@ -413,9 +449,9 @@ class AlphaGAN(object):
         self.save_dir = args.save_dir
         self.gpu_mode = args.gpu_mode
         self.device = args.device
-        self.lrG = args.lrG
-        self.lrD = args.lrD
-        self.com_loss = args.com_loss
+        self.lrG = args.lrG #Learning Rate, Generator
+        self.lrD = args.lrD #Learning Rate Discriminator
+        self.com_loss = args.com_loss#Compositional Loss
         self.fine_tune = args.fine_tune
         self.visual = args.visual
         self.env = args.env
@@ -448,11 +484,11 @@ class AlphaGAN(object):
             self.G_criterion = t.nn.SmoothL1Loss().to(self.device)
             self.D_criterion = t.nn.MSELoss().to(self.device)
 
-        self.G_error_meter = AverageValueMeter()
-        self.Alpha_loss_meter = AverageValueMeter()
-        self.Com_loss_meter = AverageValueMeter()
-        self.Adv_loss_meter = AverageValueMeter()
-        self.D_error_meter = AverageValueMeter()
+        self.G_error_meter = AverageValueMeter()       #Generator Loss
+        self.Alpha_loss_meter = AverageValueMeter()    #Alpha Loss
+        self.Com_loss_meter = AverageValueMeter()      #Compositional Loss
+        self.Adv_loss_meter = AverageValueMeter()      #Adversial Loss
+        self.D_error_meter = AverageValueMeter()       #Discriminator Loss
 
     def train(self, dataset):
         if self.visual:
@@ -461,14 +497,15 @@ class AlphaGAN(object):
         for epoch in range(self.epoch):
             for ii, data in tqdm.tqdm(enumerate(dataset)):
                 real_img = data['I']
-                tri_img = data['T']
+                tri_img  = data['T'] #Trimap
 
                 if self.com_loss:
-                    bg_img = data['B'].to(self.device)
-                    fg_img = data['F'].to(self.device)
+                    bg_img = data['B'].to(self.device) #Background image
+                    fg_img = data['F'].to(self.device) #Foreground image
 
-                # input to the G
+                # input to the G, 4 Channel, Image and Trimap concatenated
                 input_img = t.tensor(np.append(real_img.numpy(), tri_img.numpy(), axis=1)).to(self.device)
+                
 
                 # real_alpha
                 real_alpha = data['A'].to(self.device)
@@ -484,21 +521,23 @@ class AlphaGAN(object):
                     # real_img_d = input_img[:, 0:3, :, :]
                     tri_img_d = input_img[:, 3:4, :, :]
 
-                    # 真正的alpha 交给判别器判断
+                    #alpha 
                     if self.com_loss:
                         real_d = self.D(input_img)
                     else:
                         real_d = self.D(t.cat([real_alpha, tri_img_d], dim=1))
 
-                    target_real_label = t.tensor(1.0)
+                    target_real_label = t.tensor(1.0) #1 for real
+                    #The shape of real_d would be NxN
                     target_real = target_real_label.expand_as(real_d).to(self.device)
+                    
 
                     loss_d_real = self.D_criterion(real_d, target_real)
-                    #loss_d_real.backward()
 
-                    # 生成器生成fake_alpha 交给判别器判断
+                    #fake_alpha, is the predicted alpha by the generator 
                     fake_alpha = self.G(input_img)
                     if self.com_loss:
+                        #Constructing the fake Image
                         fake_img = fake_alpha*fg_img + (1 - fake_alpha) * bg_img
                         fake_d = self.D(t.cat([fake_img, tri_img_d], dim=1))
                     else:
@@ -510,28 +549,31 @@ class AlphaGAN(object):
                     loss_d_fake = self.D_criterion(fake_d, target_fake)
 
                     loss_D = loss_d_real + loss_d_fake
+                    #Backpropagation of the  discriminator loss
                     loss_D.backward()
                     self.D_optimizer.step()
                     self.D_error_meter.add(loss_D.item())
 
                 # train G
                 if ii % self.g_every == 0:
+                    #Initialize the Optimizer
                     self.G_optimizer.zero_grad()
 
                     real_img_g = input_img[:, 0:3, :, :]
-                    tri_img_g = input_img[:, 3:4, :, :]
+                    tri_img_g  = input_img[:, 3:4, :, :]
 
-                    fake_alpha = self.G(input_img)
-                    # fake_alpha 与 real_alpha的L1 loss
+                    fake_alpha   = self.G(input_img)
+                    # fake_alpha  is the output of the Generator
                     loss_g_alpha = self.G_criterion(fake_alpha, real_alpha)
-                    loss_G = loss_g_alpha
+                    #alpha_loss, difference between predicted alpha and the real alpha
+                    loss_G       = loss_g_alpha
                     self.Alpha_loss_meter.add(loss_g_alpha.item())
 
                     if self.com_loss:
-                        fake_img = fake_alpha * fg_img + (1 - fake_alpha) * bg_img
-                        loss_g_cmp = self.G_criterion(fake_img, real_img_g)
+                        fake_img   = fake_alpha * fg_img + (1 - fake_alpha) * bg_img
+                        loss_g_cmp = self.G_criterion(fake_img, real_img_g)#Composition Loss
 
-                        # 迷惑判别器
+                       
                         fake_d = self.D(t.cat([fake_img, tri_img_g], dim=1))
                         self.Com_loss_meter.add(loss_g_cmp.item())
                         loss_G = loss_G + loss_g_cmp
@@ -539,6 +581,7 @@ class AlphaGAN(object):
                     else:
                         fake_d = self.D(t.cat([fake_alpha, tri_img_g], dim=1))
                     target_fake = t.tensor(1.0).expand_as(fake_d).to(self.device)
+                    #The target of Generator is to make the Discriminator ouptut 1
                     loss_g_d = self.D_criterion(fake_d, target_fake)
 
                     self.Adv_loss_meter.add(loss_g_d.item())

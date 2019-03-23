@@ -451,7 +451,7 @@ class AlphaGAN(object):
         self.device = args.device
         self.lrG = args.lrG #Learning Rate, Generator
         self.lrD = args.lrD #Learning Rate Discriminator
-        self.com_loss = args.com_loss#Compositional Loss
+        self.com_loss = args.com_loss#Compositional Loss, if it does not exist, it signifies that the image is one dimensional
         self.fine_tune = args.fine_tune
         self.visual = args.visual
         self.env = args.env
